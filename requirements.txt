@@ -1,0 +1,12 @@
+pyspark==3.5.0
+google-cloud-bigquery
+google-cloud-bigquery-storage
+google-cloud-storage
+pandas
+pyarrow
+fastavro
+confluent-kafka
+attrs
+httpx
+cachetools
+authlib
