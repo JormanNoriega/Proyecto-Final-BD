@@ -83,7 +83,7 @@ try:
                 producer.flush()
                 elapsed = time.time() - start
                 rate = count / elapsed
-                print(f"Progreso: {count} eventos enviados (≈ {rate:.0f} msg/s)")
+                print(f"Progreso: {count} eventos enviados (aprox {rate:.0f} msg/s)")
 
 except KeyboardInterrupt:
     print("\nInterrupción recibida. Cerrando productor...")

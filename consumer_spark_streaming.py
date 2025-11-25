@@ -1,91 +1,154 @@
 import os
+import signal
+import sys
+import json
+import io
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, window, count, avg, max, current_timestamp,
     to_timestamp, udf
 )
-from pyspark.sql.types import BinaryType
-from pyspark.sql.avro.functions import from_avro
+from pyspark.sql.types import (
+    BinaryType, StructType, StructField, StringType, 
+    LongType, IntegerType
+)
+from avro.io import BinaryDecoder, DatumReader
+import avro.schema
 
 # ===================== CONFIG ======================
+# Credenciales GCP (asegúrate que el JSON existe y tiene permisos suficientes)
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = r"C:\clave_gcp\service_key.json"
 
+# Kafka
 KAFKA_BOOTSTRAP = "localhost:9092"
 KAFKA_TOPIC = "datos_streaming_big_data"
+
+# Avro
 AVRO_SCHEMA_FILE = "user_event.avsc"
 
-PROJECT = "bigdatastreaming-479202"
-DATASET = "streaming"
-TABLE_RAW = f"{PROJECT}.{DATASET}.eventos_streaming_raw_avro"
-TABLE_AGG = f"{PROJECT}.{DATASET}.eventos_streaming_agg_avro"
+# BigQuery destino
+BQ_PROJECT = "bigdatastreaming-479202"
+BQ_DATASET = "streaming"
+BQ_TABLE_RAW = f"{BQ_PROJECT}.{BQ_DATASET}.eventos_streaming_raw_avro"
+BQ_TABLE_AGG = f"{BQ_PROJECT}.{BQ_DATASET}.eventos_streaming_agg_avro"
 
-# Modo direct (BigQuery Storage Write API)
-USE_STORAGE_WRITE_DIRECT = True  # Dejamos True para evitar el error del esquema gs
-# Si algún día quieres volver al bucket temporal, define:
-# TEMP_GCS_BUCKET = "spark-bigquery-staging-bucket"
-# y pon USE_STORAGE_WRITE_DIRECT = False
-
+# Streaming
 CHECKPOINT_ROOT = "checkpoints_streaming_avro"
+WATERMARK = "10 minutes"
 WINDOW_LENGTH = "5 minutes"
 WINDOW_SLIDE = "5 minutes"
-WATERMARK = "10 minutes"
 TRIGGER_INTERVAL = "30 seconds"
 
+# ===================== SPARK SESSION ======================
 spark = (
     SparkSession.builder
     .appName("KafkaStreamingToBigQueryAvro")
     .config(
         "spark.jars.packages",
         "com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.40.0,"
-        "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,"
-        "org.apache.spark:spark-avro_2.12:3.5.0"
+        "org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.0"
     )
+    # Opcional: si instalaste Python 3.11, fuerza su uso para los workers
+    .config("spark.executorEnv.PYSPARK_PYTHON", "C:/Python311/python.exe")
+    .config("spark.python.worker.reuse", "true")
+    # Escritura directa a BigQuery (Storage Write API)
+    .config("spark.bigquery.writeMethod", "direct")
+    # Rendimiento y cierre ordenado
     .config("spark.sql.shuffle.partitions", "200")
     .config("spark.streaming.stopGracefullyOnShutdown", "true")
+    # Opcional: directorio temporal dedicado para Spark en Windows
+    .config("spark.local.dir", "C:/spark_local_tmp")
     .getOrCreate()
 )
+spark.sparkContext.setLogLevel("ERROR")  # Solo mostrar errores críticos
 
-spark.sparkContext.setLogLevel("WARN")
-
-# Leer schema Avro
+# ===================== LEER SCHEMA AVRO ======================
 with open(AVRO_SCHEMA_FILE, "r", encoding="utf-8") as f:
     avro_schema_str = f.read()
 
-# Fuente Kafka
+# ===================== LEER KAFKA (binary) ======================
 kafka_df = (
     spark.readStream
     .format("kafka")
     .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
     .option("subscribe", KAFKA_TOPIC)
-    .option("startingOffsets", "latest")
+    .option("startingOffsets", "earliest")  # Leer desde el principio del topic
+    .option("failOnDataLoss", "false")  # Continuar aunque falten offsets antiguos
+    .option("maxOffsetsPerTrigger", "50000")  # Limitar carga por batch para evitar sobrecarga
     .load()
 )
 
-# Quitar header Confluent (1 byte magic + 4 bytes schema id)
-def strip_header(b: bytes) -> bytes:
-    if b and len(b) > 5:
-        return b[5:]
-    return b
+# ===================== SCHEMA SPARK PARA EVENTOS ======================
+event_schema = StructType([
+    StructField("event_id", StringType(), True),
+    StructField("user_id", LongType(), True),
+    StructField("session_id", LongType(), True),
+    StructField("event_type", StringType(), True),
+    StructField("item_id", LongType(), True),
+    StructField("timestamp", StringType(), True),
+    StructField("duration_seconds", IntegerType(), True),
+    StructField("device", StringType(), True),
+    StructField("country", StringType(), True),
+    StructField("event_generated_at", StringType(), True)
+])
 
-strip_udf = udf(strip_header, BinaryType())
-payload_df = kafka_df.select(strip_udf(col("value")).alias("payload"))
+# ===================== UDF PARA DESERIALIZAR AVRO CON PYTHON ======================
+# Cargar schema de Avro
+avro_schema_obj = avro.schema.parse(avro_schema_str)
 
-# Deserializar Avro
-events_df = payload_df.select(
-    from_avro(col("payload"), avro_schema_str).alias("event")
-).select("event.*")
+def deserialize_avro(binary_value):
+    """Deserializa Avro desde bytes binarios de Confluent"""
+    if not binary_value or len(binary_value) <= 5:
+        return None
+    
+    try:
+        # Quitar header de Confluent (5 bytes: magic byte + schema id)
+        avro_payload = binary_value[5:]
+        
+        # Deserializar con avro-python3
+        bytes_reader = io.BytesIO(avro_payload)
+        decoder = BinaryDecoder(bytes_reader)
+        reader = DatumReader(avro_schema_obj)
+        event = reader.read(decoder)
+        
+        # Retornar como tupla en el orden del schema
+        return (
+            event.get('event_id'),
+            event.get('user_id'),
+            event.get('session_id'),
+            event.get('event_type'),
+            event.get('item_id'),
+            event.get('timestamp'),
+            event.get('duration_seconds'),
+            event.get('device'),
+            event.get('country'),
+            event.get('event_generated_at')
+        )
+    except Exception as e:
+        # En caso de error, retornar None
+        return None
 
-# Limpieza y timestamps
+# Registrar UDF
+deserialize_udf = udf(deserialize_avro, event_schema)
+
+# ===================== DESERIALIZAR AVRO ======================
+events_df = (
+    kafka_df
+    .select(deserialize_udf(col("value")).alias("event"))
+    .select("event.*")
+    .filter(col("event_id").isNotNull())  # Filtrar errores de deserialización
+)
+
+# ===================== LIMPIEZA Y CAMPOS DE TIEMPO ======================
 clean_df = (
     events_df
-    .filter(col("event_id").isNotNull())
     .filter(col("timestamp").isNotNull())
     .withColumn("event_time", to_timestamp(col("timestamp")))
     .withColumn("event_generated_at_ts", to_timestamp(col("event_generated_at")))
     .withColumn("processing_timestamp", current_timestamp())
 )
 
-# Agregación por ventana
+# ===================== AGREGACIÓN POR VENTANA ======================
 agg_df = (
     clean_df
     .withWatermark("event_time", WATERMARK)
@@ -106,48 +169,60 @@ agg_df = (
     )
 )
 
+# ===================== ESCRITURA A BIGQUERY ======================
 def _write_to_bigquery(batch_df, table_name):
-    writer = (
+    (
         batch_df.write
         .format("bigquery")
         .option("table", table_name)
+        .option("writeMethod", "direct")  # Forzar Storage Write API a nivel de writer
         .mode("append")
+        .save()
     )
-    if USE_STORAGE_WRITE_DIRECT:
-        writer = writer.option("writeMethod", "direct")
-    else:
-        # writer = writer.option("temporaryGcsBucket", TEMP_GCS_BUCKET)
-        raise ValueError("TEMP_GCS_BUCKET no definido. Activa direct o define el bucket.")
-    writer.save()
 
 def write_batch_raw(batch_df, batch_id):
     try:
         rows = batch_df.count()
+        print(f"[RAW] Micro-lote {batch_id} - Procesando {rows} filas")
+        
         if rows > 0:
-            print(f"[RAW] batch_id={batch_id} filas={rows}")
-            latency_sample = (
-                batch_df
-                .select(
-                    (col("processing_timestamp").cast("long") - col("event_time").cast("long"))
-                    .alias("latency_seconds")
-                )
-                .where(col("event_time").isNotNull())
-                .limit(5)
-            )
-            latency_sample.show(truncate=False)
-        _write_to_bigquery(batch_df, TABLE_RAW)
+            # Muestra algunos registros de ejemplo
+            print(f"[RAW] Muestra de datos:")
+            batch_df.select("event_id", "event_type", "user_id", "timestamp").show(5, truncate=False)
+            
+            # Escribir a BigQuery
+            print(f"[RAW] Escribiendo a BigQuery: {BQ_TABLE_RAW}")
+            _write_to_bigquery(batch_df, BQ_TABLE_RAW)
+            print(f"[RAW] ✓ Escritura exitosa a BigQuery")
+        else:
+            print(f"[RAW] No hay datos en este micro-lote")
     except Exception as e:
-        print(f"[ERROR RAW] batch_id={batch_id} {e}")
+        print(f"[ERROR RAW] Micro-lote {batch_id}: {e}")
+        import traceback
+        traceback.print_exc()
 
 def write_batch_agg(batch_df, batch_id):
     try:
         rows = batch_df.count()
+        print(f"[AGG] Micro-lote {batch_id} - Procesando {rows} filas")
+        
         if rows > 0:
-            print(f"[AGG] batch_id={batch_id} filas={rows}")
-        _write_to_bigquery(batch_df, TABLE_AGG)
+            # Muestra agregaciones
+            print(f"[AGG] Muestra de agregaciones:")
+            batch_df.show(10, truncate=False)
+            
+            # Escribir a BigQuery
+            print(f"[AGG] Escribiendo a BigQuery: {BQ_TABLE_AGG}")
+            _write_to_bigquery(batch_df, BQ_TABLE_AGG)
+            print(f"[AGG] ✓ Escritura exitosa a BigQuery")
+        else:
+            print(f"[AGG] No hay datos en este micro-lote")
     except Exception as e:
-        print(f"[ERROR AGG] batch_id={batch_id} {e}")
+        print(f"[ERROR AGG] Micro-lote {batch_id}: {e}")
+        import traceback
+        traceback.print_exc()
 
+# ===================== INICIAR STREAMS ======================
 raw_query = (
     clean_df.writeStream
     .outputMode("append")
@@ -166,12 +241,30 @@ agg_query = (
     .start()
 )
 
-print("Streaming Avro iniciado. Ctrl+C para detener.")
-try:
-    spark.streams.awaitAnyTermination()
-except KeyboardInterrupt:
-    print("Interrupción recibida. Deteniendo consultas...")
-    raw_query.stop()
-    agg_query.stop()
-    spark.stop()
-    print("Finalizado correctamente.")
+# ===================== APAGADO ORDENADO ======================
+def graceful_shutdown(signum, frame):
+    print(f"\nSeñal {signum} recibida. Deteniendo streaming queries...")
+    try:
+        active_queries = spark.streams.active
+        for q in active_queries:
+            try:
+                print(f"Deteniendo {q.id}")
+                q.stop()
+            except Exception as e:
+                print(f"Error al detener {q.id}: {e}")
+    except Exception as e:
+        print(f"Error al obtener queries activas: {e}")
+    
+    print("Deteniendo SparkSession...")
+    try:
+        spark.stop()
+    except Exception as e:
+        print(f"Error al detener SparkSession: {e}")
+    print("Apagado completo.")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, graceful_shutdown)
+signal.signal(signal.SIGTERM, graceful_shutdown)
+
+print(">> Streaming Avro iniciado. Ctrl+C para detener.")
+spark.streams.awaitAnyTermination()
