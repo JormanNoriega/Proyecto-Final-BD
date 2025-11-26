@@ -45,3 +45,55 @@ services:
     environment:
       KAFKA_BROKERCONNECT: "kafka:29092"
       JVM_OPTS: "-Xms32M -Xmx64M"
+
+  postgres:
+    image: postgres:15
+    container_name: postgres_bigdata
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: bigdata
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d bigdata"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  dremio:
+    image: dremio/dremio-oss:latest
+    container_name: dremio_bigdata
+    ports:
+      - "9047:9047"   # Web UI
+      - "31010:31010" # ODBC/JDBC
+      - "45678:45678" # Arrow Flight
+    environment:
+      DREMIO_JAVA_SERVER_EXTRA_OPTS: "-Xmx4g -Xms1g"
+    volumes:
+      - dremio_data:/opt/dremio/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana_bigdata
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource,yesoreyeram-infinity-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - postgres
+      - dremio
+
+volumes:
+  postgres_data:
+  dremio_data:
+  grafana_data:
